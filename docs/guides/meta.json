@@ -3,6 +3,7 @@
   "description": "Technical guides for operators and developers",
   "pages": [
     "SETUP_GUIDE",
+    "SOURCE_INSTALL_GUIDE",
     "USER_GUIDE",
     "DOCKER_GUIDE",
     "ELECTRON_GUIDE",

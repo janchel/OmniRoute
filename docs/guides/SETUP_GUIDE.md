@@ -58,6 +58,12 @@ PORT=20128 DASHBOARD_PORT=20129 NEXT_PUBLIC_BASE_URL=http://localhost:20129 npm 
 
 > **Note:** `npm install` auto-generates `.env` from `.env.example` on first run. Subsequent installs will not overwrite an existing `.env`, so customizations are preserved. To re-seed, delete `.env` before re-running.
 
+> **Long-form walkthrough:** for the complete, verified source install — Node.js setup,
+> the npm 11 native-dependency gate, `better-sqlite3` compilation, first-run bootstrap,
+> and every failure mode hit on a real deployment (including the dev-server HMR
+> "spinning login page" fix) — see the
+> [📦 Source Install & Deployment Guide](./SOURCE_INSTALL_GUIDE.md).
+
 ### Docker
 
 See the [Docker Guide](./DOCKER_GUIDE.md) for complete Docker setup including Compose profiles and Caddy HTTPS.
