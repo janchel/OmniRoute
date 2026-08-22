@@ -15,6 +15,8 @@ lastUpdated: 2026-06-28
 - [Docker Compose](#docker-compose)
 - [Available Profiles](#available-profiles)
 - [Configuring host CLI tools when OmniRoute runs in Docker](#configuring-host-cli-tools-when-omniroute-runs-in-docker)
+- [Deployment Workflow](#deployment-workflow)
+- [Inside the Container: Baked vs Mounted](#inside-the-container-baked-vs-mounted)
 - [Redis Sidecar](#redis-sidecar)
 - [Production Compose](#production-compose)
 - [Dockerfile Stages](#dockerfile-stages)
@@ -163,6 +165,107 @@ docker compose --profile base up -d
   writing schema/config will fight. Stop one before starting the other.
 - Web profile note: Chromium's browser cache lives under `/home/node/.cache` (owned by
   UID 1000). With a custom UID, also set `HOME` to a writable directory via `.env`.
+
+## Deployment Workflow
+
+### First deploy
+
+```bash
+git clone https://github.com/<you>/OmniRoute.git && cd OmniRoute
+
+# 1. Create your env file from the template
+cp .env.example .env
+
+# 2. Set secrets (required before first start)
+#    JWT_SECRET:      openssl rand -base64 48
+#    API_KEY_SECRET:  openssl rand -hex 32
+
+# 3. (Optional) reuse an existing native install's data — see the section above
+#    OMNIROUTE_HOST_DATA_DIR / OMNIROUTE_CONTAINER_UID / OMNIROUTE_CONTAINER_GID
+
+# 4. Build + start (first build downloads deps and compiles — allow 10–15 min;
+#    BuildKit caches layers, so later rebuilds are much faster)
+docker compose --profile base up -d --build
+
+# 5. Verify
+curl -s http://localhost:20128/api/monitoring/health   # → {"status":"healthy",...}
+docker compose logs -f omniroute                       # watch startup
+```
+
+Everything happens inside `docker build` — dependency install, Turbopack production
+build, standalone assembly. Node/npm are **not** required on the host; only Docker and
+the repo checkout.
+
+### Keeping it updated
+
+| What changed                                             | Command                                       | Notes                                                                                       |
+| -------------------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Application code (`src/`, `open-sse/`, …)                | `docker compose --profile base up -d --build` | Code is baked into the image at build time — a rebuild is mandatory, edits never hot-reload |
+| `.env` / compose environment                             | `docker compose --profile base up -d`         | No rebuild; compose recreates the container with the new env                                |
+| Data in the mounted data dir (`storage.sqlite`, logs, …) | nothing — it is live                          | Bind-mount is shared with the container in real time                                        |
+| `package-lock.json` changed upstream                     | same as code change (`--build`)               | Dep layer cache is invalidated automatically; that build takes longer                       |
+
+There is no dev/hot-reload mode under Compose. For iterating on code, run `npm run dev`
+on the host instead (it can share the same data dir — just not simultaneously with a
+running container).
+
+Day-2 operations:
+
+```bash
+docker compose --profile base ps            # status + health
+docker compose --profile base logs -f       # tail app logs
+docker compose --profile base down          # stop & remove containers (data untouched)
+docker compose --profile base down -v       # ⚠ also wipes named volumes (redis data, sidecars)
+```
+
+## Inside the Container: Baked vs Mounted
+
+The image is an immutable snapshot: application files are **baked** at build time and
+only the data directory (plus profile-specific host paths) is **mounted** at runtime.
+Rebuilding the image never touches mounted data; recreating the container never
+requires a rebuild.
+
+### Baked into the image at build time
+
+| Content                                                                    | Path in container                                   | Source                                                                                                     |
+| -------------------------------------------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Next.js standalone server (server.js, compiled app, traced node_modules)   | `/app`                                              | `COPY --from=builder /app/.build/next/standalone ./`                                                       |
+| better-sqlite3 native module                                               | `/app/node_modules/better-sqlite3`                  | Explicit `COPY` in the Dockerfile (guaranteed complete regardless of tracing)                              |
+| onnxruntime-node native runtime (binding + dlopen'd `libonnxruntime.so.1`) | `/app/node_modules/onnxruntime-node/bin`            | `NATIVE_ASSET_ENTRIES` in `scripts/build/assembleStandalone.mjs` (the tracer cannot see the sibling `.so`) |
+| SQLite migrations                                                          | `/app/migrations`                                   | Assembled from `src/lib/db/migrations`; `OMNIROUTE_MIGRATIONS_DIR=/app/migrations` points runtime at them  |
+| Healthcheck + entrypoint guard                                             | `/app/healthcheck.mjs`, `/app/check-permissions.sh` | Copied explicitly; not traced by standalone output                                                         |
+| Runtime defaults                                                           | —                                                   | `NODE_ENV=production`, `PORT=20128`, `HOSTNAME=0.0.0.0`, `DATA_DIR=/app/data`, `OMNIROUTE_MEMORY_MB=1024`  |
+| Process model                                                              | —                                                   | Non-root `node` user (UID/GID 1000); entrypoint warns if the data dir is not writable                      |
+
+Profile extras baked into their image flavors:
+
+| Stage        | Extra content                                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `runner-web` | Playwright + playwright-core, Chromium at `/home/node/.cache/ms-playwright` (~300 MB extra)                         |
+| `runner-cli` | `git`, Docker CLI + compose plugin, global CLIs (`@openai/codex`, `@anthropic-ai/claude-code`, `droid`, `openclaw`) |
+
+### Mounted at runtime (survives rebuilds and recreates)
+
+| Mount                                             | Container path  | Contents                                                                     |
+| ------------------------------------------------- | --------------- | ---------------------------------------------------------------------------- |
+| `${OMNIROUTE_HOST_DATA_DIR:-./data}` (bind mount) | `/app/data`     | `storage.sqlite` (+ WAL/SHM), `call_logs/`, `db_backups/`, `logs/`, `cache/` |
+| `omniroute-redis-data` (named volume)             | `/data` (redis) | Rate-limiter/cache persistence                                               |
+
+Profile-specific extra mounts (active only with that profile):
+
+| Profile       | Host path → container path                                                                                        | Mode                             |
+| ------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `cli`         | `/var/run/docker.sock` → `/var/run/docker.sock`                                                                   | rw                               |
+| `cli`         | `/usr/libexec/docker/cli-plugins` → same                                                                          | ro                               |
+| `cli`         | `${AUTO_UPDATE_HOST_REPO_DIR:-.}` → `/workspace/omniroute`                                                        | rw                               |
+| `host`        | `~/.local/bin`, `~/.codex`, `~/.claude`, `~/.factory`, `~/.openclaw`, `~/.cursor`, `~/.config/cursor` → `/host-*` | mixed (see `docker-compose.yml`) |
+| `memory`      | `omniroute-qdrant-data` → `/qdrant/storage`                                                                       | named volume                     |
+| `bifrost`     | `omniroute-bifrost-data` → `/data`                                                                                | named volume                     |
+| `cliproxyapi` | `cliproxyapi-data` → `/root/.cli-proxy-api`                                                                       | named volume                     |
+
+Environment variables come from `env_file: .env` plus the `environment:` block in
+`docker-compose.yml`. They are injected when the container is **created**, which is why
+`.env` changes need `up -d` (recreate) but no rebuild.
 
 ## Redis Sidecar
 
