@@ -15,6 +15,8 @@ lastUpdated: 2026-06-28
 - [Docker Compose](#docker-compose)
 - [Available Profiles](#available-profiles)
 - [Configuring host CLI tools when OmniRoute runs in Docker](#configuring-host-cli-tools-when-omniroute-runs-in-docker)
+- [Deployment Workflow](#deployment-workflow)
+- [Inside the Container: Baked vs Mounted](#inside-the-container-baked-vs-mounted)
 - [Redis Sidecar](#redis-sidecar)
 - [Production Compose](#production-compose)
 - [Dockerfile Stages](#dockerfile-stages)
@@ -164,6 +166,107 @@ docker compose --profile base up -d
 - Web profile note: Chromium's browser cache lives under `/home/node/.cache` (owned by
   UID 1000). With a custom UID, also set `HOME` to a writable directory via `.env`.
 
+## Deployment Workflow
+
+### First deploy
+
+```bash
+git clone https://github.com/<you>/OmniRoute.git && cd OmniRoute
+
+# 1. Create your env file from the template
+cp .env.example .env
+
+# 2. Set secrets (required before first start)
+#    JWT_SECRET:      openssl rand -base64 48
+#    API_KEY_SECRET:  openssl rand -hex 32
+
+# 3. (Optional) reuse an existing native install's data — see the section above
+#    OMNIROUTE_HOST_DATA_DIR / OMNIROUTE_CONTAINER_UID / OMNIROUTE_CONTAINER_GID
+
+# 4. Build + start (first build downloads deps and compiles — allow 10–15 min;
+#    BuildKit caches layers, so later rebuilds are much faster)
+docker compose --profile base up -d --build
+
+# 5. Verify
+curl -s http://localhost:20128/api/monitoring/health   # → {"status":"healthy",...}
+docker compose logs -f omniroute                       # watch startup
+```
+
+Everything happens inside `docker build` — dependency install, Turbopack production
+build, standalone assembly. Node/npm are **not** required on the host; only Docker and
+the repo checkout.
+
+### Keeping it updated
+
+| What changed                                             | Command                                       | Notes                                                                                       |
+| -------------------------------------------------------- | --------------------------------------------- | ------------------------------------------------------------------------------------------- |
+| Application code (`src/`, `open-sse/`, …)                | `docker compose --profile base up -d --build` | Code is baked into the image at build time — a rebuild is mandatory, edits never hot-reload |
+| `.env` / compose environment                             | `docker compose --profile base up -d`         | No rebuild; compose recreates the container with the new env                                |
+| Data in the mounted data dir (`storage.sqlite`, logs, …) | nothing — it is live                          | Bind-mount is shared with the container in real time                                        |
+| `package-lock.json` changed upstream                     | same as code change (`--build`)               | Dep layer cache is invalidated automatically; that build takes longer                       |
+
+There is no dev/hot-reload mode under Compose. For iterating on code, run `npm run dev`
+on the host instead (it can share the same data dir — just not simultaneously with a
+running container).
+
+Day-2 operations:
+
+```bash
+docker compose --profile base ps            # status + health
+docker compose --profile base logs -f       # tail app logs
+docker compose --profile base down          # stop & remove containers (data untouched)
+docker compose --profile base down -v       # ⚠ also wipes named volumes (redis data, sidecars)
+```
+
+## Inside the Container: Baked vs Mounted
+
+The image is an immutable snapshot: application files are **baked** at build time and
+only the data directory (plus profile-specific host paths) is **mounted** at runtime.
+Rebuilding the image never touches mounted data; recreating the container never
+requires a rebuild.
+
+### Baked into the image at build time
+
+| Content                                                                    | Path in container                                   | Source                                                                                                     |
+| -------------------------------------------------------------------------- | --------------------------------------------------- | ---------------------------------------------------------------------------------------------------------- |
+| Next.js standalone server (server.js, compiled app, traced node_modules)   | `/app`                                              | `COPY --from=builder /app/.build/next/standalone ./`                                                       |
+| better-sqlite3 native module                                               | `/app/node_modules/better-sqlite3`                  | Explicit `COPY` in the Dockerfile (guaranteed complete regardless of tracing)                              |
+| onnxruntime-node native runtime (binding + dlopen'd `libonnxruntime.so.1`) | `/app/node_modules/onnxruntime-node/bin`            | `NATIVE_ASSET_ENTRIES` in `scripts/build/assembleStandalone.mjs` (the tracer cannot see the sibling `.so`) |
+| SQLite migrations                                                          | `/app/migrations`                                   | Assembled from `src/lib/db/migrations`; `OMNIROUTE_MIGRATIONS_DIR=/app/migrations` points runtime at them  |
+| Healthcheck + entrypoint guard                                             | `/app/healthcheck.mjs`, `/app/check-permissions.sh` | Copied explicitly; not traced by standalone output                                                         |
+| Runtime defaults                                                           | —                                                   | `NODE_ENV=production`, `PORT=20128`, `HOSTNAME=0.0.0.0`, `DATA_DIR=/app/data`, `OMNIROUTE_MEMORY_MB=1024`  |
+| Process model                                                              | —                                                   | Non-root `node` user (UID/GID 1000); entrypoint warns if the data dir is not writable                      |
+
+Profile extras baked into their image flavors:
+
+| Stage        | Extra content                                                                                                       |
+| ------------ | ------------------------------------------------------------------------------------------------------------------- |
+| `runner-web` | Playwright + playwright-core, Chromium at `/home/node/.cache/ms-playwright` (~300 MB extra)                         |
+| `runner-cli` | `git`, Docker CLI + compose plugin, global CLIs (`@openai/codex`, `@anthropic-ai/claude-code`, `droid`, `openclaw`) |
+
+### Mounted at runtime (survives rebuilds and recreates)
+
+| Mount                                             | Container path  | Contents                                                                     |
+| ------------------------------------------------- | --------------- | ---------------------------------------------------------------------------- |
+| `${OMNIROUTE_HOST_DATA_DIR:-./data}` (bind mount) | `/app/data`     | `storage.sqlite` (+ WAL/SHM), `call_logs/`, `db_backups/`, `logs/`, `cache/` |
+| `omniroute-redis-data` (named volume)             | `/data` (redis) | Rate-limiter/cache persistence                                               |
+
+Profile-specific extra mounts (active only with that profile):
+
+| Profile       | Host path → container path                                                                                        | Mode                             |
+| ------------- | ----------------------------------------------------------------------------------------------------------------- | -------------------------------- |
+| `cli`         | `/var/run/docker.sock` → `/var/run/docker.sock`                                                                   | rw                               |
+| `cli`         | `/usr/libexec/docker/cli-plugins` → same                                                                          | ro                               |
+| `cli`         | `${AUTO_UPDATE_HOST_REPO_DIR:-.}` → `/workspace/omniroute`                                                        | rw                               |
+| `host`        | `~/.local/bin`, `~/.codex`, `~/.claude`, `~/.factory`, `~/.openclaw`, `~/.cursor`, `~/.config/cursor` → `/host-*` | mixed (see `docker-compose.yml`) |
+| `memory`      | `omniroute-qdrant-data` → `/qdrant/storage`                                                                       | named volume                     |
+| `bifrost`     | `omniroute-bifrost-data` → `/data`                                                                                | named volume                     |
+| `cliproxyapi` | `cliproxyapi-data` → `/root/.cli-proxy-api`                                                                       | named volume                     |
+
+Environment variables come from `env_file: .env` plus the `environment:` block in
+`docker-compose.yml`. They are injected when the container is **created**, which is why
+`.env` changes need `up -d` (recreate) but no rebuild.
+
 ## Redis Sidecar
 
 OmniRoute relies on Redis to back the distributed rate limiter and shared cache. The `redis` service is **always defined** in `docker-compose.yml` (it has no profile gate) and starts alongside any other profile.
@@ -293,12 +396,12 @@ The 1 GiB Docker default is a dashboard/light-chat floor, not a production siz
 
 Size **cgroup `--memory` above the heap** — native buffers, SQLite, and compression intermediates sit outside V8.
 
-| Workload | `OMNIROUTE_MEMORY_MB` | Container / cgroup | Notes |
-| --- | --- | --- | --- |
-| Dashboard, one light chat | `1024` (image default) | ≥2 GiB | |
-| One coding agent (Claude/Codex/Grok) | `8192` | ≥10 GiB | Typical single-session `/v1/responses` |
-| Two concurrent long `/v1/responses` | `10240`–`12288` | ≥12–16 GiB | Measured V8 abort at ~12 GiB heap |
-| Three+ concurrent long contexts | do not on one process | serialize / more RAM | Default heavyweight admission is 1 in-flight; raising it without RAM reintroduces the abort |
+| Workload                             | `OMNIROUTE_MEMORY_MB`  | Container / cgroup   | Notes                                                                                       |
+| ------------------------------------ | ---------------------- | -------------------- | ------------------------------------------------------------------------------------------- |
+| Dashboard, one light chat            | `1024` (image default) | ≥2 GiB               |                                                                                             |
+| One coding agent (Claude/Codex/Grok) | `8192`                 | ≥10 GiB              | Typical single-session `/v1/responses`                                                      |
+| Two concurrent long `/v1/responses`  | `10240`–`12288`        | ≥12–16 GiB           | Measured V8 abort at ~12 GiB heap                                                           |
+| Three+ concurrent long contexts      | do not on one process  | serialize / more RAM | Default heavyweight admission is 1 in-flight; raising it without RAM reintroduces the abort |
 
 `omniroute serve` on bare metal calibrates ~35% of RAM (clamped `[512, 4096]`) when `OMNIROUTE_MEMORY_MB` is **unset**. Docker always sets `1024`, so that calibration never runs in the official image.
 
@@ -312,19 +415,19 @@ docker run -d --name omniroute --restart unless-stopped --stop-timeout 40 \
 
 Beyond the defaults documented in [ENVIRONMENT.md](../reference/ENVIRONMENT.md), the following variables matter most when running under Docker:
 
-| Variable                      | Purpose                                                                                             | Default                  |
-| ----------------------------- | --------------------------------------------------------------------------------------------------- | ------------------------ |
-| `OMNIROUTE_WS_BRIDGE_SECRET`  | Shared secret for the WebSocket bridge. **Required in production** — set to a strong random string. | unset (must be provided) |
-| `REDIS_URL`                   | Connection string for the rate limiter / cache backend                                              | `redis://redis:6379`     |
-| `REDIS_PORT`                  | Host-side port for the bundled Redis container                                                      | `6379`                   |
-| `REDIS_BIND_HOST`             | Host interface the bundled Redis port is published on (loopback unless you add AUTH)                | `127.0.0.1`              |
-| `AUTO_UPDATE_HOST_REPO_DIR`   | Host path mounted into `cli` profile at `/workspace/omniroute` for self-update workflows            | `.` (current directory)  |
+| Variable                      | Purpose                                                                                                                                                                    | Default                  |
+| ----------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------ |
+| `OMNIROUTE_WS_BRIDGE_SECRET`  | Shared secret for the WebSocket bridge. **Required in production** — set to a strong random string.                                                                        | unset (must be provided) |
+| `REDIS_URL`                   | Connection string for the rate limiter / cache backend                                                                                                                     | `redis://redis:6379`     |
+| `REDIS_PORT`                  | Host-side port for the bundled Redis container                                                                                                                             | `6379`                   |
+| `REDIS_BIND_HOST`             | Host interface the bundled Redis port is published on (loopback unless you add AUTH)                                                                                       | `127.0.0.1`              |
+| `AUTO_UPDATE_HOST_REPO_DIR`   | Host path mounted into `cli` profile at `/workspace/omniroute` for self-update workflows                                                                                   | `.` (current directory)  |
 | `OMNIROUTE_MEMORY_MB`         | Runtime Node heap ceiling for the Docker standalone server; overrides the image default above. Coding agents: `8192`+ (see [runtime RAM](#runtime-ram-for-coding-agents)). | `1024`                   |
-| `DASHBOARD_PORT` / `API_PORT` | Override exposed ports for dashboard (20128) and API (20129)                                        | `20128` / `20129`        |
-| `OMNIROUTE_BASE_PATH`         | URL subpath when the app is published behind a reverse proxy (e.g. `/omniroute`)                    | _(empty = root)_         |
-| `NEXT_PUBLIC_BASE_URL`        | Public browser origin including the subpath (e.g. `https://host/omniroute`)                         | unset                    |
-| `PROD_DASHBOARD_PORT`         | Host-side dashboard port for `docker-compose.prod.yml`                                              | `20130`                  |
-| `CLIPROXYAPI_PORT`            | Host-side port for the `cliproxyapi` sidecar                                                        | `8317`                   |
+| `DASHBOARD_PORT` / `API_PORT` | Override exposed ports for dashboard (20128) and API (20129)                                                                                                               | `20128` / `20129`        |
+| `OMNIROUTE_BASE_PATH`         | URL subpath when the app is published behind a reverse proxy (e.g. `/omniroute`)                                                                                           | _(empty = root)_         |
+| `NEXT_PUBLIC_BASE_URL`        | Public browser origin including the subpath (e.g. `https://host/omniroute`)                                                                                                | unset                    |
+| `PROD_DASHBOARD_PORT`         | Host-side dashboard port for `docker-compose.prod.yml`                                                                                                                     | `20130`                  |
+| `CLIPROXYAPI_PORT`            | Host-side port for the `cliproxyapi` sidecar                                                                                                                               | `8317`                   |
 
 ## Reverse Proxy on a Subpath (Traefik / nginx)
 
@@ -386,11 +489,11 @@ intervals.
 
 For orchestrators (Kubernetes, Nomad, etc.):
 
-| Probe | Prefer | Avoid |
-| --- | --- | --- |
-| Liveness | HTTP `GET /livez`, or TCP on the main port (`PORT`, default `20128`) | `/api/monitoring/health` as liveness |
-| Readiness | HTTP `GET /healthz` | Tight timeouts that treat event-loop busy as dead |
-| Deep / blackbox | `/api/monitoring/health` | — |
+| Probe           | Prefer                                                               | Avoid                                             |
+| --------------- | -------------------------------------------------------------------- | ------------------------------------------------- |
+| Liveness        | HTTP `GET /livez`, or TCP on the main port (`PORT`, default `20128`) | `/api/monitoring/health` as liveness              |
+| Readiness       | HTTP `GET /healthz`                                                  | Tight timeouts that treat event-loop busy as dead |
+| Deep / blackbox | `/api/monitoring/health`                                             | —                                                 |
 
 `/healthz` reports process lifecycle (`ok` / `starting` / `stopping`). `/livez` is
 process-alive only (200 whenever the handler can run; it does not wait for
@@ -456,10 +559,10 @@ Endpoint tunnel panels (Cloudflare, Tailscale, ngrok) can be shown or hidden fro
 
 ## Image Tags
 
-| Image                    | Tag      | Size   | Description           |
-| ------------------------ | -------- | ------ | --------------------- |
+| Image                    | Tag      | Size   | Description                                          |
+| ------------------------ | -------- | ------ | ---------------------------------------------------- |
 | `diegosouzapw/omniroute` | `latest` | ~250MB | Highest **published** stable SemVer (not git `main`) |
-| `diegosouzapw/omniroute` | `3.8.0`  | ~250MB | Pin this class of tag for GitOps |
+| `diegosouzapw/omniroute` | `3.8.0`  | ~250MB | Pin this class of tag for GitOps                     |
 
 Multi-platform manifest: `linux/amd64` + `linux/arm64` native (Apple Silicon, AWS Graviton, Raspberry Pi). Docker selects the matching architecture automatically; pass `--platform linux/amd64` if you need to force AMD64 emulation on ARM hosts.
 
@@ -467,12 +570,12 @@ Multi-platform manifest: `linux/amd64` + `linux/arm64` native (Apple Silicon, AW
 
 OmniRoute publishes separate Docker channels for stable releases, active release-branch testing, and development builds.
 
-| Channel                         | Source                              | Mutability                  | Recommended use                                                                                 |
-| ------------------------------- | ----------------------------------- | --------------------------- | ----------------------------------------------------------------------------------------------- |
-| `:<version>` / `:<version>-web` | Signed/versioned release            | Immutable                   | Production deployments that pin an exact release                                                |
+| Channel                         | Source                              | Mutability                  | Recommended use                                                                                                       |
+| ------------------------------- | ----------------------------------- | --------------------------- | --------------------------------------------------------------------------------------------------------------------- |
+| `:<version>` / `:<version>-web` | Signed/versioned release            | Immutable                   | Production deployments that pin an exact release                                                                      |
 | `:latest` / `:latest-web`       | Highest **published** stable SemVer | Mutable stable pointer      | Follows stable releases **after** a SemVer publish job — does **not** track `main` or unreleased `release/v*` commits |
-| `:next` / `:next-web`           | Current default `release/v*` branch | Mutable pre-release pointer | Testing fixes that have landed on the active release branch but are not yet in a stable release |
-| `:main` / `:main-web`           | `main` branch                       | Mutable development pointer | Development and integration testing only                                                        |
+| `:next` / `:next-web`           | Current default `release/v*` branch | Mutable pre-release pointer | Testing fixes that have landed on the active release branch but are not yet in a stable release                       |
+| `:main` / `:main-web`           | `main` branch                       | Mutable development pointer | Development and integration testing only                                                                              |
 
 #### Using the pre-release channel
 
@@ -516,30 +619,30 @@ A release-branch build can never move `latest`; only an eligible stable semantic
 
 **`latest` is not a currency guarantee for git.** Merged fixes on `main` or on the active `release/v*` branch are **not** in `:latest` until a stable SemVer image is published and the publish job promotes `:latest` (same digest as that SemVer). If `latest` looks frozen while GitHub already shows the fix, pull `:next` to test the release branch or wait for the SemVer tag.
 
-| You want | Use |
-| --- | --- |
-| GitOps / production that must not drift | Pin `:X.Y.Z` (or the image digest) |
-| Follow published stables and accept a recreate on each release | `:latest` |
-| Test unreleased `release/v*` commits | `:next` (not production) |
-| Test `main` | `:main` (not production) |
+| You want                                                       | Use                                |
+| -------------------------------------------------------------- | ---------------------------------- |
+| GitOps / production that must not drift                        | Pin `:X.Y.Z` (or the image digest) |
+| Follow published stables and accept a recreate on each release | `:latest`                          |
+| Test unreleased `release/v*` commits                           | `:next` (not production)           |
+| Test `main`                                                    | `:main` (not production)           |
 
 ## Availability: default SQLite is single-replica
 
 Stock Docker / Kubernetes OmniRoute is **one Node process + one SQLite writer**. High availability is **not supported** on that topology.
 
-| Constraint | Consequence |
-| --- | --- |
-| Single writer | Do **not** run multiple replicas against the same SQLite file. That corrupts the DB. |
+| Constraint                            | Consequence                                                                                                                                                                                                                                                                                             |
+| ------------------------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Single writer                         | Do **not** run multiple replicas against the same SQLite file. That corrupts the DB.                                                                                                                                                                                                                    |
 | Recreate / restart / HEALTHCHECK kill | **Full outage** of in-flight SSE, dashboard sessions, and in-memory state. Every connected client drops. New requests during the empty-endpoint window get a reverse-proxy **`502 Bad Gateway: Unknown error`**, not OmniRoute JSON — clients cannot distinguish this from a provider failure (#11015). |
-| Same event loop as `/healthz` | A busy catalog or compression tick can delay probes; a short timeout then restarts the **only** replica. |
+| Same event loop as `/healthz`         | A busy catalog or compression tick can delay probes; a short timeout then restarts the **only** replica.                                                                                                                                                                                                |
 
 **Probe matrix** (see also [Kubernetes probe recommendations](../ops/MONITORING_GUIDE.md#kubernetes-probe-recommendations)):
 
-| Probe | Target | Do not use |
-| --- | --- | --- |
-| Liveness | TCP on `PORT` (default `20128`), or soft HTTP `/healthz` | `/api/monitoring/health` |
-| Readiness | HTTP `GET /healthz` | Tight timeouts that treat event-loop busy as dead |
-| Deep / humans | `/api/monitoring/health` | Automated kubelet liveness |
+| Probe         | Target                                                   | Do not use                                        |
+| ------------- | -------------------------------------------------------- | ------------------------------------------------- |
+| Liveness      | TCP on `PORT` (default `20128`), or soft HTTP `/healthz` | `/api/monitoring/health`                          |
+| Readiness     | HTTP `GET /healthz`                                      | Tight timeouts that treat event-loop busy as dead |
+| Deep / humans | `/api/monitoring/health`                                 | Automated kubelet liveness                        |
 
 **Upgrades:** expect every session to drop. Drain clients if you can; there is no rolling update on default SQLite. Compose `restart: unless-stopped` plus Docker `HEALTHCHECK` will also replace the only process when the container is Unhealthy — same blast radius.
 
@@ -580,13 +683,13 @@ One Node process is **one V8 heap**. Two overlapping ~3 MiB / ~750k-token codi
 
 To go beyond two concurrent **large** jobs **today**:
 
-| Do | Do not |
-| --- | --- |
-| Run **N containers/pods**, each with its **own** `DATA_DIR` / volume | Set `replicas > 1` against one SQLite file |
-| Keep each instance at 1–2 heavy in-flight and 12–16 Gi cgroup | Give one process 8× RAM and `max=8` |
-| Optional: `QUOTA_STORE_DRIVER=redis` + `QUOTA_STORE_REDIS_URL` for **shared quota counters** | Treat Redis as shared SQLite — it is not |
-| Duplicate provider secrets into each instance (or accept partitioned dashboards) | Expect one dashboard / one call-log across instances |
-| Front with any load balancer; sticky by API key or session is enough | Require a vendor-specific size-aware middleware |
+| Do                                                                                           | Do not                                               |
+| -------------------------------------------------------------------------------------------- | ---------------------------------------------------- |
+| Run **N containers/pods**, each with its **own** `DATA_DIR` / volume                         | Set `replicas > 1` against one SQLite file           |
+| Keep each instance at 1–2 heavy in-flight and 12–16 Gi cgroup                                | Give one process 8× RAM and `max=8`                  |
+| Optional: `QUOTA_STORE_DRIVER=redis` + `QUOTA_STORE_REDIS_URL` for **shared quota counters** | Treat Redis as shared SQLite — it is not             |
+| Duplicate provider secrets into each instance (or accept partitioned dashboards)             | Expect one dashboard / one call-log across instances |
+| Front with any load balancer; sticky by API key or session is enough                         | Require a vendor-specific size-aware middleware      |
 
 Hardware: `concurrent_large ≈ N × 2` at ~8–12 Gi heap / ~12–16 Gi cgroup **per instance**. Host RAM must cover `N × cgroup`, not “one 16 Gi pod with N=8.”
 
