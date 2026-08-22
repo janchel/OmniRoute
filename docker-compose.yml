@@ -24,6 +24,14 @@
 #  See docs/architecture/cluster-decisions.md for the per-component rationale
 #  (Qdrant=opt-in, Bifrost=opt-in, Caddy=upstream LB, no Dragonfly/NATS/PG/Neo4j/MinIO).
 #
+#  Reusing an existing native install's data (e.g. ~/.omniroute):
+#    set in .env —
+#      OMNIROUTE_HOST_DATA_DIR=/home/<you>/.omniroute
+#      OMNIROUTE_CONTAINER_UID=<your host UID>
+#      OMNIROUTE_CONTAINER_GID=<your host GID>
+#    The UID/GID mapping makes SQLite WAL writes work without chowning host
+#    files; defaults match the image's baked-in `node` user (1000:1000).
+#
 #  Before first run, copy .env.example → .env and edit your secrets.
 # ──────────────────────────────────────────────────────────────────────
 
@@ -31,6 +39,12 @@ x-common: &common
   restart: unless-stopped
   stop_grace_period: 40s
   env_file: .env
+  # Run-as UID/GID inside the container. Default 1000:1000 == image `node` user
+  # (identical to the pre-override behavior). Override when bind-mounting a
+  # host data dir owned by another user so SQLite writes succeed un-chowned.
+  # Note (web profile): Chromium's cache lives under /home/node/.cache (owned
+  # by UID 1000) — with a custom UID set HOME to a writable dir via .env.
+  user: "${OMNIROUTE_CONTAINER_UID:-1000}:${OMNIROUTE_CONTAINER_GID:-1000}"
   environment:
     - DATA_DIR=/app/data # Must match the volume mount below
     - OMNIROUTE_BASE_PATH=${OMNIROUTE_BASE_PATH:-}
@@ -49,7 +63,10 @@ x-common: &common
     - OMNIROUTE_CODEX_APPSERVER_WS=${OMNIROUTE_CODEX_APPSERVER_WS:-ws://codex-app-server:1456}
     - OMNIROUTE_CODEX_APPSERVER_WS_TOKEN_FILE=${OMNIROUTE_CODEX_APPSERVER_WS_TOKEN_FILE:-/run/codex-appserver/token}
   volumes:
-    - ./data:/app/data
+    # Host path of the data dir. Defaults to ./data next to this file. Point it
+    # at an existing native install (e.g. /home/<you>/.omniroute) to reuse its
+    # storage.sqlite / call_logs / backups in place.
+    - ${OMNIROUTE_HOST_DATA_DIR:-./data}:/app/data
     # Shared capability token + codex auth for the app-server WS. Only meaningful
     # when the codex-app-server profile is active. The token dir carries the WS
     # capability token; the codex home is where the dashboard "Apply auth" writes
@@ -169,7 +186,7 @@ services:
       - "${API_PORT:-20129}:${API_PORT:-20129}"
       - "${LIVE_WS_PORT:-20132}:${LIVE_WS_PORT:-20132}"
     volumes:
-      - ./data:/app/data
+      - ${OMNIROUTE_HOST_DATA_DIR:-./data}:/app/data
       - /var/run/docker.sock:/var/run/docker.sock
       - /usr/libexec/docker/cli-plugins:/usr/libexec/docker/cli-plugins:ro
       - ${AUTO_UPDATE_HOST_REPO_DIR:-.}:/workspace/omniroute:rw
@@ -208,7 +225,7 @@ services:
       # - CLI_CLINE_BIN=cline
       # - CLI_CONTINUE_BIN=cn
     volumes:
-      - ./data:/app/data
+      - ${OMNIROUTE_HOST_DATA_DIR:-./data}:/app/data
       # ── Host binary mounts (read-only) ──
       # Adjust paths below to match YOUR host system.
       - ~/.local/bin:/host-local/bin:ro
