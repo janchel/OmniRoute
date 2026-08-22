@@ -139,6 +139,31 @@ is intentional. Pass `--allow-container-write` to any `setup-*` command, or set
 `OMNIROUTE_ALLOW_CONTAINER_CONFIG_WRITE=true` for the server. The write proceeds
 with a warning that it will not survive the container.
 
+## Reusing an Existing Native Install's Data
+
+If you ran OmniRoute natively (`npm run dev` / CLI) and want Docker to keep using that
+same data — SQLite DB, call logs, backups — bind-mount it instead of copying:
+
+```bash
+# in .env
+OMNIROUTE_HOST_DATA_DIR=/home/<you>/.omniroute   # host dir mounted at /app/data
+OMNIROUTE_CONTAINER_UID=$(id -u)                 # match the dir owner…
+OMNIROUTE_CONTAINER_GID=$(id -g)                 # …so SQLite WAL writes work un-chowned
+
+docker compose --profile base up -d
+```
+
+- Defaults are `./data` and `1000:1000` (the image's `node` user) — identical to the
+  historical behavior when the vars are unset.
+- The UID/GID mapping avoids `chown -R` on the host: the container process runs as the
+  same UID/GID that owns the directory, so files created inside (WAL/SHM sidecars, logs)
+  stay owned by your user and remain usable by native runs.
+- Do **not** run a native instance and the container against the same `storage.sqlite`
+  at the same time — SQLite WAL tolerates concurrent readers, but two live servers
+  writing schema/config will fight. Stop one before starting the other.
+- Web profile note: Chromium's browser cache lives under `/home/node/.cache` (owned by
+  UID 1000). With a custom UID, also set `HOME` to a writable directory via `.env`.
+
 ## Redis Sidecar
 
 OmniRoute relies on Redis to back the distributed rate limiter and shared cache. The `redis` service is **always defined** in `docker-compose.yml` (it has no profile gate) and starts alongside any other profile.

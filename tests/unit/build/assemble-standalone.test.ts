@@ -35,6 +35,8 @@ function seedSidecarSources(root: string) {
   const files = [
     "node_modules/wreq-js/rust/lib.so",
     "node_modules/better-sqlite3/build/Release/better_sqlite3.node",
+    "node_modules/onnxruntime-node/bin/napi-v3/linux/x64/onnxruntime_binding.node",
+    "node_modules/onnxruntime-node/bin/napi-v3/linux/x64/libonnxruntime.so.1",
     "src/mitm/tproxy/native/build/Release/transparent.node",
     "node_modules/@swc/helpers/package.json",
     "node_modules/pino-abstract-transport/index.js",
@@ -172,6 +174,16 @@ test("async and sync sidecar copy paths produce identical bundle trees", async (
     "node_modules/sql.js/dist/sql-wasm.wasm",
   ]) {
     assert.ok(asyncTree.includes(sqlJsFile), `sql.js runtime file copied: ${sqlJsFile}`);
+  }
+  // onnxruntime-node: the tracer copies the statically-required .node binding but
+  // NOT its dlopen'd sibling shared library — without the explicit native-asset
+  // entry the standalone bundle crashes on first import with
+  // "libonnxruntime.so.1: cannot open shared object file".
+  for (const ortFile of [
+    "node_modules/onnxruntime-node/bin/napi-v3/linux/x64/onnxruntime_binding.node",
+    "node_modules/onnxruntime-node/bin/napi-v3/linux/x64/libonnxruntime.so.1",
+  ]) {
+    assert.ok(asyncTree.includes(ortFile), `onnxruntime-node native file copied: ${ortFile}`);
   }
   fs.rmSync(tmp, { recursive: true, force: true });
 });
