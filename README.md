@@ -1010,9 +1010,19 @@ Full table: [Docker Guide — runtime RAM](docs/guides/DOCKER_GUIDE.md#runtime-r
 > are **not supported for production**. See
 > [Docker Release Channels](docs/guides/DOCKER_GUIDE.md#release-channels).
 
+**🧹 Dev-space cleanup**
+
+Source builds (`docker compose ... --build`) accumulate stale layers over time.
+`scripts/dev/cleanup-dev-space.sh` reclaims that disk safely: prunes the Docker
+build cache (keeping the freshest entries via `--keep-storage SIZE`, default
+`5GB`, so rebuilds stay fast), dangling `<none>` images, and the npm download
+cache — never touching tagged images, containers/volumes, `node_modules`, or
+bind-mounted app data. Use `--dry-run` to preview or `--yes` for unattended runs.
+
 **🥟 Bun**
 
 Standard `bun install` and global installation (`bun install -g omniroute`) are supported via Bun runtime detection:
+
 - **Built-in `bun:sqlite`**: OmniRoute uses Bun's built-in `bun:sqlite` driver when running under Bun, falling back to `better-sqlite3` on Node.js or `sql.js`.
 - **Automatic Webpack bundler selection**: Development (`bun run dev`) and production builds (`bun run build`) automatically detect Bun and disable Turbopack in favor of Webpack to prevent native V8 binding incompatibilities.
 - **Dedicated Bun Dockerfile**: Multi-stage `Dockerfile.bun` for native Bun production deployments (`docker build -f Dockerfile.bun -t omniroute:bun .`).
