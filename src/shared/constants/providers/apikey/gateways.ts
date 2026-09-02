@@ -639,19 +639,6 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
       text: "Dahl auto-generates tokens via https://inference.dahl.global/tokens. No signup needed. Rate limits apply. You can also add your own API key.",
     },
   },
-  hackclub: {
-    id: "hackclub",
-    alias: "hc",
-    name: "Hackclub AI",
-    icon: "auto_awesome",
-    color: "#FF6B00",
-    textIcon: "HC",
-    website: "https://ai.hackclub.com",
-    hasFree: true,
-    freeNote: "Free AI for Hack Club members — 30+ models, no credit card.",
-    passthroughModels: true,
-    authHint: "Sign in with your Hack Club account at ai.hackclub.com.",
-  },
   freetheai: {
     id: "freetheai",
     alias: "fta",
@@ -673,11 +660,12 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     color: "#F97316",
     textIcon: "G4F",
     website: "https://g4f.space",
-    hasFree: true,
-    freeNote: "Free no-key reverse proxy to Groq (gpt4free project) — rate-limited to 5 req/min.",
+    hasFree: false,
+    freeNote:
+      "No-key reverse proxy to Groq (gpt4free project) — the anonymous free tier is gone; keyless calls return insufficient_credits until you bake proof-of-work credits. A g4f.dev member key is required.",
     passthroughModels: true,
     authHint:
-      "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
+      "Anonymous use now needs proof-of-work credits baked at g4f.dev/chat — sign up at g4f.dev/members.html for a member key.",
   },
   "g4f-gemini": {
     id: "g4f-gemini",
@@ -687,11 +675,12 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     color: "#F97316",
     textIcon: "G4F",
     website: "https://g4f.space",
-    hasFree: true,
-    freeNote: "Free no-key reverse proxy to Gemini (gpt4free project) — rate-limited to 5 req/min.",
+    hasFree: false,
+    freeNote:
+      "No-key reverse proxy to Gemini (gpt4free project) — the anonymous free tier is gone; keyless calls return insufficient_credits until you bake proof-of-work credits. A g4f.dev member key is required.",
     passthroughModels: true,
     authHint:
-      "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
+      "Anonymous use now needs proof-of-work credits baked at g4f.dev/chat — sign up at g4f.dev/members.html for a member key.",
   },
   "g4f-pollinations": {
     id: "g4f-pollinations",
@@ -701,12 +690,12 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     color: "#F97316",
     textIcon: "G4F",
     website: "https://g4f.space",
-    hasFree: true,
+    hasFree: false,
     freeNote:
-      "Free no-key reverse proxy to Pollinations (gpt4free project) — rate-limited to 5 req/min.",
+      "No-key reverse proxy to Pollinations (gpt4free project) — the anonymous free tier is gone; keyless calls return insufficient_credits until you bake proof-of-work credits. A g4f.dev member key is required.",
     passthroughModels: true,
     authHint:
-      "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
+      "Anonymous use now needs proof-of-work credits baked at g4f.dev/chat — sign up at g4f.dev/members.html for a member key.",
   },
   "g4f-ollama": {
     id: "g4f-ollama",
@@ -716,11 +705,12 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     color: "#F97316",
     textIcon: "G4F",
     website: "https://g4f.space",
-    hasFree: true,
-    freeNote: "Free no-key hosted Ollama gateway (gpt4free project) — rate-limited to 5 req/min.",
+    hasFree: false,
+    freeNote:
+      "No-key hosted Ollama gateway (gpt4free project) — the anonymous free tier is gone; keyless calls return insufficient_credits until you bake proof-of-work credits. A g4f.dev member key is required.",
     passthroughModels: true,
     authHint:
-      "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
+      "Anonymous use now needs proof-of-work credits baked at g4f.dev/chat — sign up at g4f.dev/members.html for a member key.",
   },
   "g4f-nvidia": {
     id: "g4f-nvidia",
@@ -730,12 +720,12 @@ export const APIKEY_PROVIDERS_GATEWAYS = {
     color: "#F97316",
     textIcon: "G4F",
     website: "https://g4f.space",
-    hasFree: true,
+    hasFree: false,
     freeNote:
-      "Free no-key reverse proxy to NVIDIA NIM (gpt4free project) — rate-limited to 5 req/min.",
+      "No-key reverse proxy to NVIDIA NIM (gpt4free project) — the anonymous free tier is gone; keyless calls return insufficient_credits until you bake proof-of-work credits. A g4f.dev member key is required.",
     passthroughModels: true,
     authHint:
-      "No auth required. Free tier is limited to 5 requests/minute — sign up at g4f.dev/members.html for higher limits.",
+      "Anonymous use now needs proof-of-work credits baked at g4f.dev/chat — sign up at g4f.dev/members.html for a member key.",
   },
   "vercel-ai-gateway": {
     id: "vercel-ai-gateway",

@@ -1,6 +1,7 @@
 import { randomUUID, createHash } from "crypto";
 import { nodeTypeFromId } from "@/lib/db/providerNodeSelect";
 import { extractGoogApiKeyHeader } from "./googApiKeyAuth.ts";
+import { describeUpstreamFailure } from "@/shared/utils/upstreamError";
 import { buildAllExpiredCredentials } from "./authExpiredCredentials.ts";
 import {
   getCachedRawProviderConnections,
@@ -106,8 +107,17 @@ import {
   resolveProviderId,
   NOAUTH_PROVIDERS,
   WEB_COOKIE_PROVIDERS,
+  isSelfHostedChatProvider,
 } from "@/shared/constants/providers";
-import { isModelExcludedByConnection } from "@/domain/connectionModelRules";
+import {
+  isModelExcludedByConnection,
+  isModelAdvertisedByConnection,
+} from "@/domain/connectionModelRules";
+import {
+  getSyncedAvailableModelsByConnection,
+  SYNCED_AVAILABLE_MODELS_MALFORMED,
+  type SyncedAvailableModelsByConnection,
+} from "@/lib/db/models";
 import { isFreeModel } from "@/shared/utils/freeModels";
 import {
   applySessionAffinityPin,
@@ -1161,6 +1171,54 @@ function materializeConnection(
 }
 
 /**
+ * #11089: load the per-connection synced model inventory for self-hosted chat
+ * providers so connection selection can drop hosts that never advertised the
+ * requested model.
+ *
+ * Scoped to SELF_HOSTED_CHAT_PROVIDER_IDS: those are the providers where one
+ * provider id fans out to several independent hosts with genuinely different
+ * inventories. Hosted providers share one catalog per provider, so filtering
+ * there would only add a DB read.
+ *
+ * Returns an empty map (= no filtering) when there is no model to match, when
+ * no candidate is self-hosted, or when the persisted rows are malformed — a
+ * partial read must never silently shrink the pool.
+ */
+async function loadAdvertisedModelsForSelfHostedConnections(
+  connections: ProviderConnectionView[],
+  requestedModel: string | null
+): Promise<Map<string, Set<string>>> {
+  const advertised = new Map<string, Set<string>>();
+  if (!requestedModel) return advertised;
+
+  const selfHostedProviders = new Set(
+    connections
+      .map((c) => c.provider)
+      .filter((p): p is string => typeof p === "string" && isSelfHostedChatProvider(p))
+  );
+  if (selfHostedProviders.size === 0) return advertised;
+
+  await Promise.all(
+    [...selfHostedProviders].map(async (providerId) => {
+      let byConnection: SyncedAvailableModelsByConnection;
+      try {
+        byConnection = await getSyncedAvailableModelsByConnection(providerId);
+      } catch {
+        return;
+      }
+      // Malformed persisted rows: fail open for the whole provider.
+      if (byConnection[SYNCED_AVAILABLE_MODELS_MALFORMED]) return;
+      for (const [connectionId, models] of Object.entries(byConnection)) {
+        if (!Array.isArray(models) || models.length === 0) continue;
+        advertised.set(connectionId, new Set(models.map((m) => m.id)));
+      }
+    })
+  );
+
+  return advertised;
+}
+
+/**
  * Get provider credentials from localDb
  * Filters out unavailable accounts and returns the selected account based on strategy
  * @param {string} provider - Provider name
@@ -1435,6 +1493,14 @@ export async function getProviderCredentials(
     let modelLockedCount = 0;
     let familyLockedCount = 0;
     const connectionFilterStatus = new Map<string, string>();
+    // #11089: multi-host self-hosted providers keep a per-connection synced
+    // inventory. Without it, a request can be routed to a host that never had
+    // the model, producing a spurious model-not-found instead of pinning to
+    // the host that does. Empty map = no inventory known = no filtering.
+    const advertisedModelsByConnection = await loadAdvertisedModelsForSelfHostedConnections(
+      connections,
+      requestedModel
+    );
     // Filter out unavailable accounts and excluded connection
     let availableConnections = connections.filter((c) => {
       if (excludedConnectionIds.has(c.id)) {
@@ -1443,6 +1509,13 @@ export async function getProviderCredentials(
       }
       if (requestedModel && isModelExcludedByConnection(requestedModel, c.providerSpecificData)) {
         connectionFilterStatus.set(c.id, "modelExcluded");
+        return false;
+      }
+      if (
+        requestedModel &&
+        !isModelAdvertisedByConnection(requestedModel, advertisedModelsByConnection.get(c.id))
+      ) {
+        connectionFilterStatus.set(c.id, "modelNotAdvertised");
         return false;
       }
       if (!allowSuppressedConnections) {
@@ -1510,6 +1583,7 @@ export async function getProviderCredentials(
       const codexScopeLimited = status === "codexScopeLimited";
       const modelLocked = status === "modelLocked";
       const modelExcluded = status === "modelExcluded";
+      const modelNotAdvertised = status === "modelNotAdvertised";
       if (excluded || rateLimited) {
         log.debug(
           "AUTH",
@@ -1519,6 +1593,11 @@ export async function getProviderCredentials(
         log.debug(
           "AUTH",
           `  → ${c.id?.slice(0, 8)} | excluded by per-account model rule for ${requestedModel}`
+        );
+      } else if (modelNotAdvertised) {
+        log.debug(
+          "AUTH",
+          `  → ${c.id?.slice(0, 8)} | synced inventory does not advertise ${requestedModel}`
         );
       } else if (terminalStatus) {
         log.debug(
@@ -1632,7 +1711,8 @@ export async function getProviderCredentials(
       if (terminalConnections.length === connections.length) {
         return buildAllExpiredCredentials(terminalConnections);
       }
-      invalidateManagedLease(options, "CONNECTION_INELIGIBLE");      log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
+      invalidateManagedLease(options, "CONNECTION_INELIGIBLE");
+      log.warn("AUTH", `${provider} | all ${connections.length} accounts unavailable`);
       return null;
     }
 
@@ -2196,6 +2276,11 @@ export async function getProviderCredentialsWithQuotaPreflight(
     //   • a per-connection override on this row
     //   • a per-(provider, window) default in resilience settings
     //   • the legacy `quotaPreflightEnabled` flag in providerSpecificData
+    //   • the operator-enabled quota cutoff (resilience.quotaPreflight.enabled /
+    //     QUOTA_PREFLIGHT_CUTOFF_ENABLED) — #11234: it previously only armed the
+    //     auto-strategy candidate builder and the per-target cutoff for pinned
+    //     connections, so priority combos over sibling connections (no pinned
+    //     connectionId) never filtered an exhausted sister
     //   • the global default is stricter than the factory no-op level
     //     (factory = 2% remaining, basically "right before 429" — anything
     //     stricter means the operator wants enforcement everywhere)
@@ -2217,10 +2302,12 @@ export async function getProviderCredentialsWithQuotaPreflight(
 
     const hasConnectionOverrides = Object.keys(perConnectionWindowOverrides).length > 0;
     const legacyForceEnable = isQuotaPreflightEnabled(credentials as Record<string, unknown>);
+    const globalCutoffEnabled = resilience.quotaPreflight.enabled === true;
     if (
       !hasConnectionOverrides &&
       !providerHasDefaults &&
       !legacyForceEnable &&
+      !globalCutoffEnabled &&
       !globalDefaultIsRestrictive
     ) {
       const committed = await commitLease();
@@ -2978,7 +3065,7 @@ export async function markAccountUnavailable(
       return { shouldFallback: true, cooldownMs: lockout.cooldownMs };
     }
 
-    const errorMsg = typeof errorText === "string" ? errorText.slice(0, 100) : "Provider error";
+    const errorMsg = describeUpstreamFailure(errorText);
 
     // T09: Codex per-scope lockout (do not block the whole account globally).
     if (

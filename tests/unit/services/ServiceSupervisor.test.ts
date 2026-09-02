@@ -43,6 +43,10 @@ db.prepare(
   `INSERT OR IGNORE INTO version_manager (tool, status, port, auto_start, auto_update, provider_expose)
    VALUES ('test-adopt', 'stopped', 29996, 0, 0, 0)`
 ).run();
+db.prepare(
+  `INSERT OR IGNORE INTO version_manager (tool, status, port, auto_start, auto_update, provider_expose)
+   VALUES ('test-adopt-deny', 'stopped', 29994, 0, 0, 0)`
+).run();
 
 const { ServiceSupervisor } = await import("../../../src/lib/services/ServiceSupervisor.ts");
 
@@ -216,6 +220,10 @@ test("does NOT auto-restart on crash", async () => {
 // the port, the supervisor ADOPTS it (marks running, no child spawned) instead
 // of spawning a duplicate that would die with EADDRINUSE.
 test("#6205: probeBeforeSpawn adopts a healthy existing instance (no spawn)", async () => {
+  // GHSA-wg9p-6m2g-4v27: adoption of an already-healthy listener is opt-in
+  // (a squatter can answer 2xx), so this adoption-path test opts in explicitly.
+  const prevAdopt = process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
+  process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE = "1";
   const healthServer = startHealthServer(29996);
   const cfg = { ...tickConfig("test-adopt", 29996), probeBeforeSpawn: true };
   const sup = new ServiceSupervisor(cfg);
@@ -235,6 +243,8 @@ test("#6205: probeBeforeSpawn adopts a healthy existing instance (no spawn)", as
   } finally {
     await sup.stop();
     healthServer.close();
+    if (prevAdopt === undefined) delete process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
+    else process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE = prevAdopt;
   }
 });
 
@@ -257,6 +267,9 @@ test("adopted service resolves and records the real pid of the process holding t
   // (#10523).
   const healthServer = startHealthServer(29995);
   const cfg = { ...tickConfig("test-adopt", 29995), probeBeforeSpawn: true };
+  // Same opt-in as the adoption test above (GHSA-wg9p-6m2g-4v27).
+  const prevAdopt = process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
+  process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE = "1";
   const sup = new ServiceSupervisor(cfg);
 
   try {
@@ -271,5 +284,33 @@ test("adopted service resolves and records the real pid of the process holding t
   } finally {
     await sup.stop();
     healthServer.close();
+    if (prevAdopt === undefined) delete process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
+    else process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE = prevAdopt;
+  }
+});
+
+// GHSA-wg9p-6m2g-4v27: a healthy 2xx on the probed port no longer proves the
+// listener is this service — a local squatter can answer 200 and get adopted,
+// receiving the injected service API key. Without the operator opt-in the
+// supervisor must surface the actionable error instead of adopting.
+test("probeBeforeSpawn does NOT adopt a healthy listener without the opt-in", async () => {
+  const healthServer = startHealthServer(29994);
+  const cfg = { ...tickConfig("test-adopt-deny", 29994), probeBeforeSpawn: true };
+  const prevAdopt = process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
+  delete process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE;
+  const sup = new ServiceSupervisor(cfg);
+
+  try {
+    const status = await sup.start();
+    assert.equal(status.state, "error", "a healthy listener is not adopted by default");
+    assert.match(
+      status.lastError ?? "",
+      /OMNIROUTE_ADOPT_EXISTING_SERVICE/,
+      "the error names the opt-in escape hatch"
+    );
+  } finally {
+    await sup.stop();
+    healthServer.close();
+    if (prevAdopt !== undefined) process.env.OMNIROUTE_ADOPT_EXISTING_SERVICE = prevAdopt;
   }
 });

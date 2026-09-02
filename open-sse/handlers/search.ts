@@ -31,10 +31,12 @@ import * as xSearch from "./search/xSearch.ts";
 import { freeWebSearch } from "../services/freeWebSearch.ts";
 import { saveCallLog } from "@/lib/usageDb";
 import { safeOutboundFetch } from "@/shared/network/safeOutboundFetch";
+import { parseAndValidateNonMetadataUrl } from "@/shared/network/outboundUrlGuard";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import { z } from "zod";
 import { sanitizeErrorMessage } from "../utils/error.ts";
+import { isValidContext7LibraryId } from "../executors/context7-fetch.ts";
 import { resolveSearchProxy, executeProviderFetch } from "./search/searchProxy.ts";
 import { formatSearchProviderFailure } from "./search/providerFailure.ts";
 
@@ -210,6 +212,49 @@ function normalizeSerperResponse(
   };
 }
 
+// Context7 library-docs search results: { results: [{ id: "/owner/repo", title,
+// description, lastUpdateDate, stars, trustScore, ... }] }. The API has no URL
+// field — the library page URL is derived from the id. The relevance score is an
+// unbounded float (observed ~276), not a 0..1 score, so it is not mapped onto the
+// normalized 0..1 score field.
+interface Context7SearchItem {
+  id?: string;
+  title?: string;
+  description?: string;
+  lastUpdateDate?: string;
+}
+
+function normalizeContext7Response(
+  data: unknown,
+  _query: string,
+  _searchType: string
+): { results: SearchResult[]; totalResults: number | null } {
+  const now = new Date().toISOString();
+  const items = (data as { results?: Context7SearchItem[] } | null)?.results;
+  if (!Array.isArray(items)) return { results: [], totalResults: null };
+  // Only canonical library ids are usable: they are interpolated into a
+  // context7.com URL, so anything else (missing, "//evil.com", ".." traversal,
+  // query junk) is dropped instead of producing a misleading or off-site link.
+  // Shared guard with the fetch executor (isValidContext7LibraryId) — no drift.
+  const usable = items.filter((item): item is Context7SearchItem & { id: string } =>
+    isValidContext7LibraryId(item?.id ?? "")
+  );
+  const results = usable.map((item, idx: number) =>
+    makeResult(
+      "context7",
+      {
+        title: item?.title,
+        url: `https://context7.com${item.id}`,
+        snippet: item?.description,
+        published_at: item?.lastUpdateDate,
+      },
+      idx,
+      now
+    )
+  );
+  return { results, totalResults: null };
+}
+
 function normalizeBraveResponse(
   data: any,
   _query: string,
@@ -269,9 +314,23 @@ function getProviderSettingString(
   return undefined;
 }
 
-function resolveSearchBaseUrl(config: SearchProviderConfig, params: SearchRequestParams): string {
+export function resolveSearchBaseUrl(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): string {
   const override = getProviderSettingString(params, "baseUrl");
-  return (override || config.baseUrl).replace(/\/+$/, "");
+  if (override) {
+    // GHSA-j7j4-g9qc-q69c: the override is client-controlled (provider_options /
+    // providerSpecificData) and flows into a plain fetch() sink — validate it
+    // before any builder uses it as the server-side fetch target. Mode is
+    // block-metadata (NOT public-only): the primary searxng use case is a
+    // self-hosted instance on loopback/LAN, so private hosts keep working,
+    // while cloud-metadata endpoints (IMDS credential theft) are rejected.
+    // The catalog's own config.baseUrl is operator config and stays untouched.
+    parseAndValidateNonMetadataUrl(override);
+    return override.replace(/\/+$/, "");
+  }
+  return config.baseUrl.replace(/\/+$/, "");
 }
 
 function toSearchPageNumber(offset: number | undefined, maxResults: number): number | undefined {
@@ -318,6 +377,25 @@ function buildSerperRequest(
         ...(params.token ? { "X-API-Key": params.token } : {}),
       },
       body: JSON.stringify(body),
+    },
+  };
+}
+
+// Context7 library-docs search: GET {baseUrl}/search?query=<q>. Key optional —
+// anonymous tier works without one; a configured ctx7sk-* key rides as Bearer.
+function buildContext7Request(
+  config: SearchProviderConfig,
+  params: SearchRequestParams
+): { url: string; init: RequestInit } {
+  const qp = new URLSearchParams({ query: params.query });
+  return {
+    url: `${config.baseUrl}/search?${qp}`,
+    init: {
+      method: "GET",
+      headers: {
+        Accept: "application/json",
+        ...(params.token ? { Authorization: `Bearer ${params.token}` } : {}),
+      },
     },
   };
 }
@@ -623,6 +701,7 @@ type SearchRequestBuilder = (
 const requestBuilders: Record<string, SearchRequestBuilder> = {
   "serper-search": buildSerperRequest,
   "brave-search": buildBraveRequest,
+  context7: buildContext7Request,
   "perplexity-search": buildPerplexityRequest,
   "exa-search": buildExaRequest,
   "tavily-search": buildTavilyRequest,
@@ -1197,6 +1276,7 @@ type SearchResponseNormalizer = (
 const responseNormalizers: Record<string, SearchResponseNormalizer> = {
   "serper-search": normalizeSerperResponse,
   "brave-search": normalizeBraveResponse,
+  context7: normalizeContext7Response,
   "perplexity-search": normalizePerplexityResponse,
   "exa-search": normalizeExaResponse,
   "tavily-search": normalizeTavilyResponse,
